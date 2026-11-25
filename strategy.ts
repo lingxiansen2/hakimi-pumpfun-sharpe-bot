@@ -1,16 +1,17 @@
-// Deterministic low-variance dual-sleeve bonding-curve strategy for agent-fun/replay/v2.
+// Deterministic low-variance triple-sleeve bonding-curve strategy for agent-fun/replay/v2.
 //
 // Core design:
 //   1. Track per-wallet token balances from CreateEvent/TradeEvent to reject whale-concentrated
-//      or creator-overhang curves (creator share <= 0.5%, top-3 concentration <= 28%, >= 40 holders).
-//   2. Sleeve A (Liquid Pullback Continuation): enters active distributed leaders (real reserve
-//      15-76 SOL, 60-slot volume >= 27 SOL, >= 22 unique 60-slot buyers, positive 60/180/15-slot net
-//      inflow, low exact-SOL bot share) on a sell tick inside a 3%-15% drawdown (+45% TP / -20% SL).
-//   3. Sleeve B (Fresh-Flow Mid-Curve Dip): diversifies into earlier distributed pullbacks (real
-//      reserve 5-22 SOL, 15%-35% drawdown, >= 4 fresh buys in 15 slots, low 5-slot sell pressure)
-//      with tighter +30% TP / -15% SL / 150-slot timeout so quiet hours stay productive.
-//   4. Smooth Sharpe-first risk budget: single entry per mint, equity-capped base sizing (min(eq,10)),
-//      concurrent-open-position sizing decay, and clean pacing probes for >= 20 mint guardrails.
+//      or creator-overhang curves (creator share <= 0.5%-1%, top-3 concentration <= 28%-30%).
+//   2. Sleeve A (Liquid Pullback Continuation): active distributed leaders (real reserve 23-76 SOL,
+//      60-slot volume >= 27 SOL, >= 22 unique 60-slot buyers, positive 15-slot trend >= +7%, no
+//      > 3 SOL whale dump in 15 slots) on a sell tick inside 3%-15% drawdown (+44% TP / -20% SL).
+//   3. Sleeve B (Fresh-Flow Mid-Curve Dip): earlier distributed pullbacks (real reserve 5-20 SOL,
+//      15%-35% drawdown, >= 4 fresh buys in 15 slots, low 5-slot sell pressure) (+34% TP / -15% SL).
+//   4. Sleeve C (Organic Retail Crowd): steady distributed accumulation (>= 32 unique 60-slot buyers
+//      on calm 5-26 SOL volume, recent peak <= 120 slots, ret15 <= 0) (+18% TP / -12% SL / 90 hold).
+//   5. Sharpe-first volatility budget: capped base equity min(eq, 10), 1.15 SOL position cap,
+//      two-tier hourly gain throttle (0.25x >= +2%, 0.12x >= +4%), and 6h mint-count probes.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
@@ -23,6 +24,7 @@ interface TradeRec {
   sol: number;
   user: Pubkey;
   ix: string;
+  price: number;
 }
 
 interface CoinBook {
@@ -30,12 +32,13 @@ interface CoinBook {
   holdings: Map<Pubkey, bigint>;
   totalHeld: bigint;
   peakPrice: number;
+  peakSlot: number;
   trades: TradeRec[];
   entries: number;
 }
 
 interface PosState {
-  sleeve: 'A' | 'B';
+  sleeve: 'A' | 'B' | 'C';
   openedSlot: number;
   lastAddSlot: number;
   lastValue: number;
@@ -61,7 +64,7 @@ export function createStrategy(): Bot {
   const bookOf = (mint: Pubkey, creator = ''): CoinBook => {
     let b = books.get(mint);
     if (b === undefined) {
-      b = { creator, holdings: new Map(), totalHeld: 0n, peakPrice: 0, trades: [], entries: 0 };
+      b = { creator, holdings: new Map(), totalHeld: 0n, peakPrice: 0, peakSlot: 0, trades: [], entries: 0 };
       books.set(mint, b);
     } else if (!b.creator && creator) {
       b.creator = creator;
@@ -92,7 +95,10 @@ export function createStrategy(): Bot {
           const sol = Number(e.sol_amount) / LAMPORTS;
           const tok = BigInt(e.token_amount);
           const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-          if (price > b.peakPrice) b.peakPrice = price;
+          if (price > b.peakPrice) {
+            b.peakPrice = price;
+            b.peakSlot = e.slot;
+          }
           const prev = b.holdings.get(e.user) ?? 0n;
           if (e.is_buy) {
             b.holdings.set(e.user, prev + tok);
@@ -102,7 +108,7 @@ export function createStrategy(): Bot {
             b.holdings.set(e.user, prev - dec);
             b.totalHeld -= dec;
           }
-          b.trades.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user, ix: e.ix_name });
+          b.trades.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user, ix: e.ix_name, price });
           touched.add(e.mint);
         }
       }
@@ -173,7 +179,7 @@ export function createStrategy(): Bot {
         if (!selling) probes.set(mint, true);
       }
 
-      // 3. Portfolio budget, hourly variance throttle & sizing.
+      // 3. Portfolio budget, two-tier hourly variance throttle & sizing.
       let equity = Number(state.cash) / LAMPORTS;
       for (const ps of posMap.values()) if (ps.lastValue > 0) equity += ps.lastValue;
       if (firstTime !== null && lastTime !== null) {
@@ -184,7 +190,7 @@ export function createStrategy(): Bot {
         }
       }
       const hourRet = hourStartEq > 0 ? equity / hourStartEq - 1 : 0;
-      const hourMult = hourRet >= 0.05 ? 0.5 : 1.0;
+      const hourMult = hourRet >= 0.04 ? 0.12 : hourRet >= 0.02 ? 0.25 : 1.0;
 
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
@@ -195,7 +201,7 @@ export function createStrategy(): Bot {
       const baseEq = Math.min(equity, 10);
       const maxExp = baseEq * 0.50;
 
-      // 4. Evaluate touched curves for Sleeve A, Sleeve B, or size completion.
+      // 4. Evaluate touched curves for Sleeve A, B, C, or size completion.
       for (const mint of touched) {
         if (orders.length >= cap) break;
         const curve = state.curves.get(mint);
@@ -237,6 +243,8 @@ export function createStrategy(): Bot {
         let b15 = 0;
         let b30 = 0;
         let ex30 = 0;
+        let p15 = 0;
+        let maxS15 = 0;
         const u60 = new Set<Pubkey>();
         for (let j = b.trades.length - 1; j >= 0; j--) {
           const tr = b.trades[j]!;
@@ -255,11 +263,14 @@ export function createStrategy(): Bot {
           }
           if (d < 15) {
             n15 += sgn;
+            p15 = tr.price;
             if (tr.isBuy) b15++;
+            else if (tr.sol > maxS15) maxS15 = tr.sol;
           }
           if (d < 5 && !tr.isBuy) s5 += tr.sol;
         }
         const exactShare = b30 > 0 ? ex30 / b30 : 0;
+        const ret15 = p15 > 0 ? price / p15 - 1 : 0;
         const lastTr = b.trades[b.trades.length - 1];
 
         if (ps === undefined) {
@@ -267,7 +278,7 @@ export function createStrategy(): Bot {
           const okA =
             lastTr !== undefined &&
             !lastTr.isBuy &&
-            rq >= 15 &&
+            rq >= 23 &&
             dd >= 0.03 &&
             dd <= 0.15 &&
             holders >= 40 &&
@@ -280,7 +291,9 @@ export function createStrategy(): Bot {
             n60 >= 0 &&
             n15 >= 0.3 &&
             exactShare <= 0.25 &&
-            s5 / v60 <= 0.12;
+            s5 / v60 <= 0.12 &&
+            maxS15 <= 3.0 &&
+            ret15 >= 0.07;
 
           const okB =
             !okA &&
@@ -296,16 +309,33 @@ export function createStrategy(): Bot {
             s5 <= 0.5 &&
             v60 >= 3;
 
-          if (!okA && !okB) continue;
+          const okC =
+            !okA &&
+            !okB &&
+            rq >= 10 &&
+            rq <= 60 &&
+            holders >= 30 &&
+            top3 <= 0.30 &&
+            dev <= 0.01 &&
+            u60.size >= 32 &&
+            v60 >= 5 &&
+            v60 <= 26 &&
+            ret15 <= 0 &&
+            b15 >= 1 &&
+            now - b.peakSlot <= 120;
+
+          if (!okA && !okB && !okC) continue;
+          const sleeve = okA ? 'A' : okB ? 'B' : 'C';
+          const stakePct = sleeve === 'A' ? 0.16 : sleeve === 'B' ? 0.14 : 0.24;
           const conc = 1 / (1 + posMap.size * 0.75);
-          const targetStake = baseEq * (okA ? 0.18 : 0.14) * conc * hourMult;
+          const targetStake = Math.min(1.15, baseEq * stakePct * conc * hourMult);
           const capSol = (Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS) * 0.98;
           const amt = Math.min(capSol, targetStake, maxExp - exposure, free - tx);
           if (amt < 0.02) continue;
 
           orders.push({ side: 'buy', mint, quote_lamports: BigInt(Math.floor(amt * LAMPORTS)), max_slippage_bps: 1000 });
           posMap.set(mint, {
-            sleeve: okA ? 'A' : 'B',
+            sleeve,
             openedSlot: now,
             lastAddSlot: now,
             lastValue: 0,
@@ -313,16 +343,17 @@ export function createStrategy(): Bot {
             adds: 0,
             exiting: false,
             filled: false,
-            tp: okA ? 0.44 : 0.36,
-            sl: okA ? 0.20 : 0.15,
-            maxHold: okA ? 300 : 200,
+            tp: sleeve === 'A' ? 0.44 : sleeve === 'B' ? 0.34 : 0.18,
+            sl: sleeve === 'A' ? 0.20 : sleeve === 'B' ? 0.15 : 0.12,
+            maxHold: sleeve === 'A' ? 300 : sleeve === 'B' ? 200 : 90,
           });
           b.entries++;
           free -= amt + tx;
           exposure += amt;
           slotsLeft--;
         } else if (ps.filled && !ps.exiting && ps.adds < 2) {
-          const targetStake = baseEq * (ps.sleeve === 'A' ? 0.18 : 0.14) * hourMult;
+          const stakePct = ps.sleeve === 'A' ? 0.16 : ps.sleeve === 'B' ? 0.14 : 0.24;
+          const targetStake = Math.min(1.15, baseEq * stakePct * hourMult);
           if (ps.invested < targetStake - 0.02) {
             const pos = state.positions.get(mint);
             const cost = pos ? Number(pos.cost_lamports) / LAMPORTS : ps.invested;
@@ -343,10 +374,10 @@ export function createStrategy(): Bot {
         }
       }
 
-      // 5. Filtered pacing probe only when behind the 24-mint pace for short 6h windows.
+      // 5. Filtered pacing probe only when behind the 26-mint pace for short 6h windows.
       if (probes.size < 1 && slotsLeft > 0 && firstTime !== null && lastTime !== null) {
         const pace = Math.min(1, (lastTime - firstTime) / 18_000);
-        if (myCoins.size < Math.ceil(25 * pace)) {
+        if (myCoins.size < Math.ceil(27 * pace)) {
           for (const mint of touched) {
             if (orders.length >= cap || probes.size >= 1) break;
             if (posMap.has(mint) || probes.has(mint) || pendingByMint.has(mint) || state.positions.has(mint) || myCoins.has(mint)) continue;
