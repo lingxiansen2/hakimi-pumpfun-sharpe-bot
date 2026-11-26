@@ -7,16 +7,18 @@
 //      60-slot volume >= 27 SOL, >= 22 unique 60-slot buyers with buyers >= sellers, positive
 //      180/60-slot net inflow, 15-slot net inflow >= 3.0 SOL & trend >= +7%, lead-buyer >= 3.0 SOL,
 //      early-cohort share <= 50%, no > 3 SOL dump in 15 slots) on a sell tick inside 3%-15%
-//      drawdown (+38% TP with 55% partial lock at +24% / -20% SL / 120-slot underwater decay cut).
+//      drawdown (+34% TP with 55% partial lock at +24% / -20% SL / 120-slot underwater decay cut).
 //   3. Sleeve B (Fresh-Flow Mid-Curve Dip): earlier distributed pullbacks (real reserve 5-20 SOL,
 //      15%-35% drawdown, >= 4 fresh buys in 15 slots, buyer count >= seller count over 60 slots,
 //      non-negative 60/180-slot net flow, low 5-slot sell pressure) (+34% TP with +24% partial / -15% SL).
 //   4. Sleeve C (Organic Retail Crowd): steady distributed accumulation (>= 32 unique 60-slot buyers
-//      on calm 5-26 SOL volume, recent peak <= 120 slots, shallow dip dd <= 11% and ret15 in [-5%, 0%])
-//      (+18% TP / -12% SL / 90-slot hold).
+//      on calm 5-26 SOL volume, non-negative 60-slot net inflow, recent peak <= 120 slots, shallow
+//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -12% SL / 90-slot hold).
 //   5. Sharpe-first volatility budget: capped base equity min(eq, 10), max 2 concurrent core
 //      positions, smooth position cap (0.50 SOL * scale), continuous hyperbolic intra-hour up/down
-//      throttle (kUp=500, kDn=300) with +1.0% scaled hourly entry cap, and clean 6h mint-count probes.
+//      throttle (kUp=500, kDn=300) with +1.0% scaled hourly entry cap, two-stage intra-hour profit
+//      lock (75% trim at +1.0% hour / +12% trade; full lock at +1.2% hour / +14% trade), and
+//      clean 6h mint-count probes.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
@@ -149,7 +151,8 @@ export function createStrategy(): Bot {
       const cap = state.hello.caps.max_orders_per_batch;
       const tx = Number(state.txFeeLamports()) / LAMPORTS;
 
-      // 1. Manage exits on open core positions.
+      // 1. Mark open core positions & compute current-hour return for two-stage profit lock.
+      const posRet = new Map<Pubkey, number>();
       for (const [mint, ps] of [...posMap.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
         const pos = state.positions.get(mint);
         const curve = state.curves.get(mint);
@@ -171,7 +174,28 @@ export function createStrategy(): Bot {
         const tokens = Number(pos.token_amount);
         const val = ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
         ps.lastValue = val;
-        const ret = cost > 0 ? val / cost - 1 : 0;
+        posRet.set(mint, cost > 0 ? val / cost - 1 : 0);
+      }
+
+      let equity = Number(state.cash) / LAMPORTS;
+      for (const ps of posMap.values()) if (ps.lastValue > 0) equity += ps.lastValue;
+      if (firstTime !== null && lastTime !== null) {
+        const hb = Math.floor((lastTime - firstTime) / 3600);
+        if (hb > curHourIdx) {
+          curHourIdx = hb;
+          hourStartEq = equity;
+        }
+      }
+      const hourRet = hourStartEq > 0 ? equity / hourStartEq - 1 : 0;
+      const adjHourRet = hourRet / RISK_SCALE;
+
+      // 2. Manage exits on open core positions (TP, SL, decay, two-stage intra-hour lock, partial TP).
+      for (const [mint, ps] of [...posMap.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+        const pos = state.positions.get(mint);
+        const curve = state.curves.get(mint);
+        const pend = pendingByMint.get(mint);
+        const ret = posRet.get(mint);
+        if (pos === undefined || curve === undefined || curve.complete || ret === undefined) continue;
         const slUse = ps.partStep > 0 ? -0.18 : -ps.sl;
         const ageHold = now - ps.openedSlot;
 
@@ -180,6 +204,15 @@ export function createStrategy(): Bot {
             ps.exiting = true;
           } else if (ageHold >= 120 && ret <= -0.05) {
             ps.exiting = true;
+          } else if (adjHourRet >= 0.012 && ret >= 0.14) {
+            ps.exiting = true;
+          } else if (adjHourRet >= 0.010 && ret >= 0.12 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
+            const lockTok = (pos.token_amount * 75n) / 100n;
+            if (lockTok > 0n) {
+              orders.push({ side: 'sell', mint, token_amount: lockTok, max_slippage_bps: 10_000 });
+              ps.partStep = 1;
+              continue;
+            }
           } else if (ps.partStep === 0 && ps.sleeve !== 'C' && ret >= 0.24 && !pend?.sell && orders.length < cap) {
             const partTok = (pos.token_amount * 55n) / 100n;
             if (partTok > 0n) {
@@ -194,7 +227,7 @@ export function createStrategy(): Bot {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
       }
 
-      // 2. Close any landed guardrail probe immediately.
+      // 3. Close any landed guardrail probe immediately.
       for (const [mint, selling] of probes) {
         const pos = state.positions.get(mint);
         const curve = state.curves.get(mint);
@@ -208,18 +241,7 @@ export function createStrategy(): Bot {
         if (!selling) probes.set(mint, true);
       }
 
-      // 3. Portfolio budget, continuous hyperbolic intra-hour variance throttle & sizing.
-      let equity = Number(state.cash) / LAMPORTS;
-      for (const ps of posMap.values()) if (ps.lastValue > 0) equity += ps.lastValue;
-      if (firstTime !== null && lastTime !== null) {
-        const hb = Math.floor((lastTime - firstTime) / 3600);
-        if (hb > curHourIdx) {
-          curHourIdx = hb;
-          hourStartEq = equity;
-        }
-      }
-      const hourRet = hourStartEq > 0 ? equity / hourStartEq - 1 : 0;
-      const adjHourRet = hourRet / RISK_SCALE;
+      // 4. Portfolio budget & continuous hyperbolic intra-hour variance throttle.
       const hourMult =
         adjHourRet >= 0
           ? Math.max(0.12, 1 / (1 + adjHourRet * 500))
@@ -375,7 +397,8 @@ export function createStrategy(): Bot {
             ret15 >= -0.05 &&
             dd <= 0.11 &&
             b15 >= 1 &&
-            now - b.peakSlot <= 120;
+            now - b.peakSlot <= 120 &&
+            n60 >= 0;
 
           if (!okA && !okB && !okC) continue;
           const sleeve = okA ? 'A' : okB ? 'B' : 'C';
@@ -396,7 +419,7 @@ export function createStrategy(): Bot {
             exiting: false,
             partStep: 0,
             filled: false,
-            tp: sleeve === 'A' ? 0.38 : sleeve === 'B' ? 0.34 : 0.18,
+            tp: sleeve === 'A' ? 0.34 : sleeve === 'B' ? 0.34 : 0.18,
             sl: sleeve === 'A' ? 0.20 : sleeve === 'B' ? 0.15 : 0.12,
             maxHold: sleeve === 'A' ? 300 : sleeve === 'B' ? 200 : 90,
           });
@@ -427,10 +450,10 @@ export function createStrategy(): Bot {
         }
       }
 
-      // 5. Filtered pacing probe only when behind the 40-mint 3h pace for short 6h windows.
+      // 5. Filtered pacing probe only when behind the 42-mint 3h pace for short 6h windows.
       if (probes.size < 1 && realSlotsLeft > 0 && firstTime !== null && lastTime !== null) {
         const pace = Math.min(1, (lastTime - firstTime) / 11_000);
-        if (myCoins.size < Math.ceil(40 * pace)) {
+        if (myCoins.size < Math.ceil(42 * pace)) {
           for (const mint of touched) {
             if (orders.length >= cap || probes.size >= 1) break;
             if (posMap.has(mint) || probes.has(mint) || pendingByMint.has(mint) || state.positions.has(mint) || myCoins.has(mint)) continue;
