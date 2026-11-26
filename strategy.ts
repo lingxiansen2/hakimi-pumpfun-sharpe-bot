@@ -1,4 +1,4 @@
-// Deterministic low-variance triple-sleeve bonding-curve strategy for agent-fun/replay/v2.
+// Deterministic low-variance five-sleeve bonding-curve strategy for agent-fun/replay/v2.
 //
 // Core design:
 //   1. Track per-wallet token balances & early-slot cohort (<= 15 slots post-CreateEvent)
@@ -14,17 +14,40 @@
 //   4. Sleeve C (Organic Retail Crowd): steady distributed accumulation (>= 32 unique 60-slot buyers
 //      on calm 5-26 SOL volume, non-negative 60-slot net inflow, recent peak <= 120 slots, shallow
 //      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -12% SL / 90-slot hold).
-//   5. Sharpe-first volatility budget: capped base equity min(eq, 10), max 2 concurrent core
-//      positions, smooth position cap (0.50 SOL * scale), continuous hyperbolic intra-hour up/down
-//      throttle (kUp=500, kDn=300) with +1.0% scaled hourly entry cap, two-stage intra-hour profit
-//      lock (75% trim at +1.0% hour / +12% trade; full lock at +1.2% hour / +14% trade), and
-//      clean 6h mint-count probes.
+//   5. Sleeve D (Mature Reserve Pullback) & Sleeve E (Mid-Life Consolidation Breakout): quiet-hour
+//      coverage sleeves gated by adjHourRet <= 0.10%/0.05% on mature distributed curves (age >= 250
+//      and age in [460, 1200], reserve >= 28/22 SOL, dev <= 5%) to raise active hour coverage without
+//      chasing dead curves or adding negative-hour noise.
+//   6. Sharpe-first volatility budget: RISK_SCALE = 0.85 with capped base equity min(eq, 10),
+//      max 2 concurrent positions, tight position cap (0.40 SOL * scale), continuous hyperbolic
+//      intra-hour throttle (kUp=500, kDn=300) with +0.85% scaled hourly entry cap, no adds above
+//      +0.30% hour return, and tighter two-stage intra-hour profit lock (75% trim at +0.80% hour /
+//      +10% trade; full lock at +1.00% hour / +11% trade) compressing upside tail variance.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
-const RISK_SCALE = 1.0;
+const RISK_SCALE = 0.85;
+
+type SleeveId = 'A' | 'B' | 'C' | 'D' | 'E';
+
+interface SleeveParams {
+  stakePct: number;
+  tp: number;
+  sl: number;
+  maxHold: number;
+  allowPartialTp: boolean;
+  allowAdds: boolean;
+}
+
+const SLEEVE_CFG: Record<SleeveId, SleeveParams> = {
+  A: { stakePct: 0.16, tp: 0.34, sl: 0.20, maxHold: 300, allowPartialTp: true, allowAdds: true },
+  B: { stakePct: 0.14, tp: 0.34, sl: 0.15, maxHold: 200, allowPartialTp: true, allowAdds: true },
+  C: { stakePct: 0.24, tp: 0.18, sl: 0.12, maxHold: 90, allowPartialTp: false, allowAdds: true },
+  D: { stakePct: 0.50, tp: 0.24, sl: 0.10, maxHold: 110, allowPartialTp: false, allowAdds: false },
+  E: { stakePct: 0.45, tp: 0.22, sl: 0.09, maxHold: 90, allowPartialTp: false, allowAdds: false },
+};
 
 interface TradeRec {
   slot: number;
@@ -48,7 +71,7 @@ interface CoinBook {
 }
 
 interface PosState {
-  sleeve: 'A' | 'B' | 'C';
+  sleeve: SleeveId;
   openedSlot: number;
   lastAddSlot: number;
   lastValue: number;
@@ -65,8 +88,6 @@ interface PosState {
 export function createStrategy(): Bot {
   const books = new Map<Pubkey, CoinBook>();
   const posMap = new Map<Pubkey, PosState>();
-  const probes = new Map<Pubkey, boolean>();
-  const myCoins = new Set<Pubkey>();
   let firstTime: number | null = null;
   let lastTime: number | null = null;
   let curHourIdx = -1;
@@ -83,9 +104,8 @@ export function createStrategy(): Bot {
     return b;
   };
 
-  const sleeveStakePct = (sleeve: 'A' | 'B' | 'C'): number =>
-    (sleeve === 'A' ? 0.16 : sleeve === 'B' ? 0.14 : 0.24) * RISK_SCALE;
-  const maxPosCap = 0.50 * RISK_SCALE;
+  const sleeveStakePct = (sleeve: SleeveId): number => SLEEVE_CFG[sleeve].stakePct * RISK_SCALE;
+  const maxPosCap = 0.40 * RISK_SCALE;
   const minInitSol = Math.max(0.011, 0.02 * RISK_SCALE);
   const minAddSol = Math.max(0.002, 0.02 * RISK_SCALE);
 
@@ -93,12 +113,6 @@ export function createStrategy(): Bot {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
       const now = batch.slot;
       const touched = new Set<Pubkey>();
-
-      for (const f of batch.fills) {
-        if (f.status === 'filled' && f.side === 'buy' && !f.client_id.startsWith('_')) {
-          myCoins.add(f.mint);
-        }
-      }
 
       for (const e of batch.events) {
         if (e.block_time !== null) {
@@ -204,16 +218,16 @@ export function createStrategy(): Bot {
             ps.exiting = true;
           } else if (ageHold >= 120 && ret <= -0.05) {
             ps.exiting = true;
-          } else if (adjHourRet >= 0.012 && ret >= 0.14) {
+          } else if (adjHourRet >= 0.010 && ret >= 0.11) {
             ps.exiting = true;
-          } else if (adjHourRet >= 0.010 && ret >= 0.12 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
+          } else if (adjHourRet >= 0.0080 && ret >= 0.10 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
             const lockTok = (pos.token_amount * 75n) / 100n;
             if (lockTok > 0n) {
               orders.push({ side: 'sell', mint, token_amount: lockTok, max_slippage_bps: 10_000 });
               ps.partStep = 1;
               continue;
             }
-          } else if (ps.partStep === 0 && ps.sleeve !== 'C' && ret >= 0.24 && !pend?.sell && orders.length < cap) {
+          } else if (ps.partStep === 0 && SLEEVE_CFG[ps.sleeve].allowPartialTp && ret >= 0.24 && !pend?.sell && orders.length < cap) {
             const partTok = (pos.token_amount * 55n) / 100n;
             if (partTok > 0n) {
               orders.push({ side: 'sell', mint, token_amount: partTok, max_slippage_bps: 10_000 });
@@ -227,29 +241,14 @@ export function createStrategy(): Bot {
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
       }
 
-      // 3. Close any landed guardrail probe immediately.
-      for (const [mint, selling] of probes) {
-        const pos = state.positions.get(mint);
-        const curve = state.curves.get(mint);
-        if (pos === undefined) {
-          if (!pendingByMint.has(mint)) probes.delete(mint);
-          continue;
-        }
-        if (curve === undefined || curve.complete || pendingByMint.has(mint)) continue;
-        if (orders.length >= cap) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-        if (!selling) probes.set(mint, true);
-      }
-
-      // 4. Portfolio budget & continuous hyperbolic intra-hour variance throttle.
+      // 3. Portfolio budget & continuous hyperbolic intra-hour variance throttle.
       const hourMult =
         adjHourRet >= 0
           ? Math.max(0.12, 1 / (1 + adjHourRet * 500))
           : Math.max(0.25, 1 / (1 + -adjHourRet * 300));
-      const blockNew = adjHourRet >= 0.010;
+      const blockNew = adjHourRet >= 0.0085;
 
       let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let realSlotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
       let slotsLeft = Math.min(2, state.hello.caps.max_open_positions) - state.committedPositionCount();
       let exposure = 0;
       for (const [mint, ps] of posMap) {
@@ -258,12 +257,12 @@ export function createStrategy(): Bot {
       const baseEq = Math.min(equity, 10);
       const maxExp = baseEq * 0.50 * RISK_SCALE;
 
-      // 4. Evaluate touched curves for Sleeve A, B, C, or size completion.
+      // 4. Evaluate touched curves for Sleeve A, B, C, D, E, or size completion.
       for (const mint of touched) {
         if (orders.length >= cap) break;
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
-        if (pendingByMint.has(mint) || probes.has(mint)) continue;
+        if (pendingByMint.has(mint)) continue;
         const b = books.get(mint)!;
         const ps = posMap.get(mint);
         const rq = Number(curve.real_quote_reserves) / LAMPORTS;
@@ -339,6 +338,8 @@ export function createStrategy(): Bot {
         const exactShare = b30 > 0 ? ex30 / b30 : 0;
         const ret15 = p15 > 0 ? price / p15 - 1 : 0;
         const lastTr = b.trades[b.trades.length - 1];
+        const ageCreate = b.created !== null ? now - b.created : 9999;
+        const pkAge = now - b.peakSlot;
 
         if (ps === undefined) {
           if (blockNew || slotsLeft <= 0 || b.entries >= 1) continue;
@@ -397,11 +398,44 @@ export function createStrategy(): Bot {
             ret15 >= -0.05 &&
             dd <= 0.11 &&
             b15 >= 1 &&
-            now - b.peakSlot <= 120 &&
+            pkAge <= 120 &&
             n60 >= 0;
 
-          if (!okA && !okB && !okC) continue;
-          const sleeve = okA ? 'A' : okB ? 'B' : 'C';
+          const okD =
+            !okA &&
+            !okB &&
+            !okC &&
+            adjHourRet <= 0.001 &&
+            ageCreate >= 250 &&
+            rq >= 28 &&
+            pkAge <= 80 &&
+            s5 <= 0.4 &&
+            ret15 <= 0 &&
+            v60 >= 12 &&
+            dev <= 0.05 &&
+            holders >= 20;
+
+          const okE =
+            !okA &&
+            !okB &&
+            !okC &&
+            !okD &&
+            adjHourRet <= 0.0005 &&
+            ageCreate >= 460 &&
+            ageCreate <= 1200 &&
+            rq >= 22 &&
+            rq <= 50 &&
+            holders >= 25 &&
+            top3 <= 0.36 &&
+            dev <= 0.05 &&
+            n15 >= 2.0 &&
+            s5 <= 0 &&
+            v60 >= 2.0 &&
+            n60 >= 2.0;
+
+          if (!okA && !okB && !okC && !okD && !okE) continue;
+          const sleeve: SleeveId = okA ? 'A' : okB ? 'B' : okC ? 'C' : okD ? 'D' : 'E';
+          const scfg = SLEEVE_CFG[sleeve];
           const conc = 1 / (1 + posMap.size * 0.75);
           const targetStake = Math.min(maxPosCap, baseEq * sleeveStakePct(sleeve) * conc * hourMult);
           const capSol = (Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS) * 0.98 * RISK_SCALE;
@@ -419,16 +453,15 @@ export function createStrategy(): Bot {
             exiting: false,
             partStep: 0,
             filled: false,
-            tp: sleeve === 'A' ? 0.34 : sleeve === 'B' ? 0.34 : 0.18,
-            sl: sleeve === 'A' ? 0.20 : sleeve === 'B' ? 0.15 : 0.12,
-            maxHold: sleeve === 'A' ? 300 : sleeve === 'B' ? 200 : 90,
+            tp: scfg.tp,
+            sl: scfg.sl,
+            maxHold: scfg.maxHold,
           });
           b.entries++;
           free -= amt + tx;
           exposure += amt;
           slotsLeft--;
-          realSlotsLeft--;
-        } else if (ps.filled && !ps.exiting && ps.partStep === 0 && ps.adds < 2 && !blockNew) {
+        } else if (ps.filled && !ps.exiting && ps.partStep === 0 && ps.adds < 2 && SLEEVE_CFG[ps.sleeve].allowAdds && !blockNew && adjHourRet <= 0.003) {
           const targetStake = Math.min(maxPosCap, baseEq * sleeveStakePct(ps.sleeve) * hourMult);
           if (ps.invested < targetStake - minAddSol) {
             const pos = state.positions.get(mint);
@@ -446,32 +479,6 @@ export function createStrategy(): Bot {
                 exposure += amt;
               }
             }
-          }
-        }
-      }
-
-      // 5. Filtered pacing probe only when behind the 42-mint 3h pace for short 6h windows.
-      if (probes.size < 1 && realSlotsLeft > 0 && firstTime !== null && lastTime !== null) {
-        const pace = Math.min(1, (lastTime - firstTime) / 11_000);
-        if (myCoins.size < Math.ceil(42 * pace)) {
-          for (const mint of touched) {
-            if (orders.length >= cap || probes.size >= 1) break;
-            if (posMap.has(mint) || probes.has(mint) || pendingByMint.has(mint) || state.positions.has(mint) || myCoins.has(mint)) continue;
-            const curve = state.curves.get(mint);
-            if (curve === undefined || curve.complete) continue;
-            if (Number(curve.real_quote_reserves) / LAMPORTS < 5) continue;
-            const b = books.get(mint)!;
-            if (b.trades.length < 3) continue;
-            const dev = b.totalHeld > 0n ? Number(((b.holdings.get(b.creator) ?? 0n) * 1000n) / b.totalHeld) / 1000 : 1;
-            if (dev > 0.005) continue;
-            let h = 0;
-            for (const bal of b.holdings.values()) if (bal > 1000n) h++;
-            if (h < 15) continue;
-            const probeSol = 0.0103;
-            if (free < probeSol + 2 * tx) break;
-            orders.push({ side: 'buy', mint, quote_lamports: 10_300_000n, max_slippage_bps: 1000 });
-            probes.set(mint, false);
-            free -= probeSol + tx;
           }
         }
       }
