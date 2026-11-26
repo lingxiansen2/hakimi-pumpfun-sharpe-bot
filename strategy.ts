@@ -13,22 +13,22 @@
 //      non-negative 60/180-slot net flow, low 5-slot sell pressure) (+34% TP with +24% partial / -15% SL).
 //   4. Sleeve C (Organic Retail Crowd): steady distributed accumulation (>= 32 unique 60-slot buyers
 //      on calm 5-26 SOL volume, non-negative 60-slot net inflow, recent peak <= 120 slots, shallow
-//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -12% SL / 90-slot hold).
+//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -12% SL / 185-slot accumulation hold).
 //   5. Sleeve D (Mature Reserve Pullback) & Sleeve E (Mid-Life Consolidation Breakout): quiet-hour
 //      coverage sleeves gated by adjHourRet <= 0.10%/0.05% on mature distributed curves (age >= 250
 //      and age in [460, 1200], reserve >= 28/22 SOL, dev <= 5%) to raise active hour coverage without
-//      chasing dead curves or adding negative-hour noise.
-//   6. Sharpe-first volatility budget: RISK_SCALE = 0.85 with capped base equity min(eq, 10),
+//      chasing dead curves or adding negative-hour noise (+24%/+22% TP, -10%/-9% SL, 110/150-slot hold).
+//   6. Sharpe-first volatility budget: RISK_SCALE = 0.80 with capped base equity min(eq, 10),
 //      max 2 concurrent positions, tight position cap (0.40 SOL * scale), continuous hyperbolic
 //      intra-hour throttle (kUp=500, kDn=300) with +0.85% scaled hourly entry cap, no adds above
-//      +0.30% hour return, and tighter two-stage intra-hour profit lock (75% trim at +0.80% hour /
+//      +0.30% hour return, and centered two-stage intra-hour profit lock (75% trim at +0.75% hour /
 //      +10% trade; full lock at +1.00% hour / +11% trade) compressing upside tail variance.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
-const RISK_SCALE = 0.85;
+const RISK_SCALE = 0.80;
 
 type SleeveId = 'A' | 'B' | 'C' | 'D' | 'E';
 
@@ -39,14 +39,15 @@ interface SleeveParams {
   maxHold: number;
   allowPartialTp: boolean;
   allowAdds: boolean;
+  allowDecayExit: boolean;
 }
 
 const SLEEVE_CFG: Record<SleeveId, SleeveParams> = {
-  A: { stakePct: 0.16, tp: 0.34, sl: 0.20, maxHold: 300, allowPartialTp: true, allowAdds: true },
-  B: { stakePct: 0.14, tp: 0.34, sl: 0.15, maxHold: 200, allowPartialTp: true, allowAdds: true },
-  C: { stakePct: 0.24, tp: 0.18, sl: 0.12, maxHold: 90, allowPartialTp: false, allowAdds: true },
-  D: { stakePct: 0.50, tp: 0.24, sl: 0.10, maxHold: 110, allowPartialTp: false, allowAdds: false },
-  E: { stakePct: 0.45, tp: 0.22, sl: 0.09, maxHold: 90, allowPartialTp: false, allowAdds: false },
+  A: { stakePct: 0.16, tp: 0.34, sl: 0.20, maxHold: 300, allowPartialTp: true, allowAdds: true, allowDecayExit: true },
+  B: { stakePct: 0.14, tp: 0.34, sl: 0.15, maxHold: 200, allowPartialTp: true, allowAdds: true, allowDecayExit: true },
+  C: { stakePct: 0.24, tp: 0.18, sl: 0.12, maxHold: 185, allowPartialTp: false, allowAdds: true, allowDecayExit: false },
+  D: { stakePct: 0.50, tp: 0.24, sl: 0.10, maxHold: 110, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
+  E: { stakePct: 0.45, tp: 0.22, sl: 0.09, maxHold: 150, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
 };
 
 interface TradeRec {
@@ -216,11 +217,11 @@ export function createStrategy(): Bot {
         if (!ps.exiting) {
           if (ret >= ps.tp || ret <= slUse || ageHold >= ps.maxHold) {
             ps.exiting = true;
-          } else if (ageHold >= 120 && ret <= -0.05) {
+          } else if (SLEEVE_CFG[ps.sleeve].allowDecayExit && ageHold >= 120 && ret <= -0.05) {
             ps.exiting = true;
           } else if (adjHourRet >= 0.010 && ret >= 0.11) {
             ps.exiting = true;
-          } else if (adjHourRet >= 0.0080 && ret >= 0.10 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
+          } else if (adjHourRet >= 0.0075 && ret >= 0.10 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
             const lockTok = (pos.token_amount * 75n) / 100n;
             if (lockTok > 0n) {
               orders.push({ side: 'sell', mint, token_amount: lockTok, max_slippage_bps: 10_000 });

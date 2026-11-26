@@ -4,7 +4,7 @@
 
 # hakimi-pumpfun-sharpe-bot
 
-Deterministic Solana Pump.fun bonding-curve trading bot (`agent-fun/replay/v2`) engineered for high hourly Sharpe ratio (`1.8848` local dev), tight equity drawdown (`0.80%`), and consistent positive returns across unseen chronological windows.
+Deterministic Solana Pump.fun bonding-curve trading bot (`agent-fun/replay/v2`) engineered for high hourly Sharpe ratio (`2.1321` local dev), tight equity drawdown (`0.82%`), and consistent positive returns across unseen chronological windows.
 
 ## Strategy Architecture (`agent-fun/replay/v2`)
 
@@ -13,27 +13,27 @@ The bot processes the initial `hello` handshake (reading runtime caps such as `m
 1. **Per-Wallet Supply, Cohort & Overhang Tracking**: Maintains real-time holder balances and an early-slot cohort (`slot - created <= 15`) from `CreateEvent` and `TradeEvent` to reject whale-concentrated, creator-overhang, or sniper-dominated curves (`creator` share `<= 0.5%–1%` on core sleeves and `<= 5%` on mature coverage sleeves, top-3 concentration `<= 28%–36%`, early-cohort share `<= 50%` on Sleeve A).
 2. **Sleeve A (Liquid Pullback Continuation)**: Targets established high-velocity leaders (`23–76 SOL` real quote reserves, `>= 27 SOL` 60-slot volume, `>= 22` unique 60-slot buyers with `buyers >= sellers`, positive 180/60-slot net inflow, 15-slot net inflow `>= 3.0 SOL` & trend `>= +7%`, lead-buyer single trade `>= 3.0 SOL` in 60 slots, low `buy_exact_sol_in` share, bounded 5-slot selling, and no `> 3 SOL` single-trade sell dump in 15 slots) entered on a sell tick inside a `3%–15%` pullback (`+34%` TP with `55%` partial profit lock at `+24%` / `-20%` SL / `120`-slot underwater `-5%` decay exit / `300`-slot max hold).
 3. **Sleeve B (Fresh-Flow Mid-Curve Dip)**: Diversifies into earlier distributed pullbacks (`5–20 SOL` real quote reserves, `15%–35%` drawdown, `>= 4` fresh buys in 15 slots, buyer count `>=` seller count over 60 slots, non-negative 60/180-slot net inflow, positive 15-slot net inflow, low 5-slot selling) (`+34%` TP with `55%` partial profit lock at `+24%` / `-15%` SL / `120`-slot underwater `-5%` decay exit / `200`-slot max hold).
-4. **Sleeve C (Organic Retail Crowd)**: Captures steady retail accumulation with high unique buyer breadth (`>= 32` unique 60-slot buyers) on calm volume (`5–26 SOL`), non-negative 60-slot net inflow (`n60 >= 0`), `10–60 SOL` reserves, recent peak (`<= 120` slots), shallow pullback (`dd <= 11%`), active 15-slot buying (`>= 1` buy), and `ret15` in `[-5%, 0%]` (`+18%` TP / `-12%` SL / `90`-slot max hold).
-5. **Sleeve D (Mature Reserve Pullback) & Sleeve E (Mid-Life Consolidation Breakout)**: Quiet-hour coverage sleeves gated by scaled intra-hour return (`adjHourRet <= +0.10%` for D, `<= +0.05%` for E) on mature distributed curves (`age >= 250` slots / reserve `>= 28 SOL` / recent peak `<= 80` slots for D; `age in [460, 1200]` / reserve `22–50 SOL` / top-3 `<= 36%` / zero 5-slot sell pressure / positive 15 & 60-slot inflow for E), expanding active positive hours to `21/24` with zero negative hours (`+24%/+22%` TP, `-10%/-9%` SL, `110/90`-slot hold).
+4. **Sleeve C (Organic Retail Crowd)**: Captures steady retail accumulation with high unique buyer breadth (`>= 32` unique 60-slot buyers) on calm volume (`5–26 SOL`), non-negative 60-slot net inflow (`n60 >= 0`), `10–60 SOL` reserves, recent peak (`<= 120` slots), shallow pullback (`dd <= 11%`), active 15-slot buying (`>= 1` buy), and `ret15` in `[-5%, 0%]` (`+18%` TP / `-12%` SL / `185`-slot accumulation hold without premature underwater decay cut).
+5. **Sleeve D (Mature Reserve Pullback) & Sleeve E (Mid-Life Consolidation Breakout)**: Quiet-hour coverage sleeves gated by scaled intra-hour return (`adjHourRet <= +0.10%` for D, `<= +0.05%` for E) on mature distributed curves (`age >= 250` slots / reserve `>= 28 SOL` / recent peak `<= 80` slots for D; `age in [460, 1200]` / reserve `22–50 SOL` / top-3 `<= 36%` / zero 5-slot sell pressure / positive 15 & 60-slot inflow for E), expanding active positive hours to `21/24` with zero negative hours (`+24%/+22%` TP, `-10%/-9%` SL, `110/150`-slot hold).
 6. **Sharpe-First Volatility, Drawdown & Intra-Hour Profit-Lock Control**:
-   - Scaled risk factor (`RISK_SCALE = 0.85`), single entry per mint (`entries < 1`), max `2` concurrent positions, tight per-position cap (`0.40 SOL * scale`), `min(equity, 10 SOL)` base sizing, concurrent-position decay (`1 / (1 + open * 0.75)`), and `50%` gross exposure cap.
-   - Continuous hyperbolic intra-hour up/down throttle (`1 / (1 + 500 * adjHourRet)` on gains with `+0.85%` scaled hourly entry pause and no adds above `+0.30%`; `1 / (1 + 300 * (-adjHourRet))` on losses) combined with a tighter two-stage intra-hour profit lock (`75%` trim when `adjHourRet >= +0.80%` & trade return `>= +10%`; full close when `adjHourRet >= +1.00%` & trade return `>= +11%`) compressing upper-tail hourly variance.
+   - Scaled risk factor (`RISK_SCALE = 0.80`), single entry per mint (`entries < 1`), max `2` concurrent positions, tight per-position cap (`0.40 SOL * scale`), `min(equity, 10 SOL)` base sizing, concurrent-position decay (`1 / (1 + open * 0.75)`), and `50%` gross exposure cap.
+   - Continuous hyperbolic intra-hour up/down throttle (`1 / (1 + 500 * adjHourRet)` on gains with `+0.85%` scaled hourly entry pause and no adds above `+0.30%`; `1 / (1 + 300 * (-adjHourRet))` on losses) combined with a centered two-stage intra-hour profit lock (`75%` trim when `adjHourRet >= +0.75%` & trade return `>= +10%`; full close when `adjHourRet >= +1.00%` & trade return `>= +11%`) compressing upper-tail hourly variance.
 
 ## Local Validation (`u-jackxyz72-pump-fun-sharpe-sprint-cleanest-03e4f532`)
 
 - **Official `makefun grade-local --driver process --json` (24h dev window)**:
-  - Net PnL: `+1.8298 SOL` (`+18.30%`), `2x` Fees Net PnL: `+1.5169 SOL`
-  - Hourly Sharpe: `1.8848` (zero negative hours)
-  - Max Drawdown: `0.80%` (`0.00798`)
-  - Bootstrap 90% CI (`1,000` token resamples): `[+1.169, +2.489] SOL`
-  - Win Rate / Round Trips / Distinct Mints / Fills: `86.11%` / `36` / `36` / `105`
-  - Top-3 Concentration Share of Gains: `18.68%`
+  - Net PnL: `+1.7792 SOL` (`+17.79%`), `2x` Fees Net PnL: `+1.4801 SOL`
+  - Hourly Sharpe: `2.1321` (zero negative hours)
+  - Max Drawdown: `0.82%` (`0.00819`)
+  - Bootstrap 90% CI (`1,000` token resamples): `[+1.086, +2.455] SOL`
+  - Win Rate / Round Trips / Distinct Mints / Fills: `80.56%` / `36` / `36` / `107`
+  - Top-3 Concentration Share of Gains: `18.61%`
 - **Chronological Splits & 2x/3x Fees (`fast_sim.ts`)**:
-  - Full (`1x` / `2x` / `3x` fees): `+1.8262 SOL` (`Sharpe 1.9102`, `MaxDD 0.80%`) / `+1.5124 SOL` (`Sharpe 1.0038`) / `+1.0466 SOL` (`Sharpe 0.6715`)
-  - Half-1 (`slot < 464432291`) / Half-2 (`slot >= 464432291`): `+0.3224 SOL` (`Sharpe 1.3845`, `9m`) / `+1.4455 SOL` (`Sharpe 1.2312`, `30m`)
-  - All 4 6h Quarters: `Q1: +0.307 (1.328, 10m)`, `Q2: +0.549 (6.616, 9m)`, `Q3: +0.700 (1.488, 9m)`, `Q4: +0.373 (1.501, 7m)`
-  - All 3 8h Slices: `S1: +0.489 (1.609, 13m)`, `S2: +0.735 (2.266, 13m)`, `S3: +0.638 (1.755, 10m)`
-  - Leave-1-Hour-Out / Leave-2-Hours-Out Sharpe: `[1.8576, 2.1341]` / min `1.8036` (`21` positive hours, `0` negative hours, `3` flat hours)
+  - Full (`1x` / `2x` / `3x` fees): `+1.7737 SOL` (`Sharpe 2.1672`, `MaxDD 0.82%`) / `+1.3858 SOL` (`Sharpe 1.1354`) / `+0.7884 SOL` (`Sharpe 0.5691`)
+  - Half-1 (`slot < 464432291`) / Half-2 (`slot >= 464432291`): `+0.3765 SOL` (`Sharpe 1.9698`, `9m`) / `+1.2690 SOL` (`Sharpe 1.2402`, `30m`)
+  - All 4 6h Quarters: `Q1: +0.362 (1.847, 10m)`, `Q2: +0.521 (6.796, 9m)`, `Q3: +0.623 (1.376, 9m)`, `Q4: +0.366 (1.597, 7m)`
+  - All 3 8h Slices: `S1: +0.533 (2.176, 13m)`, `S2: +0.696 (2.279, 13m)`, `S3: +0.595 (1.873, 10m)`
+  - Leave-1-Hour-Out / Leave-2-Hours-Out Sharpe: `[2.1102, 2.4933]` / min `2.0517` (`21` positive hours, `0` negative hours, `3` flat hours)
 
 ## Run
 
