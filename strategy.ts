@@ -7,30 +7,31 @@
 //      60-slot volume >= 27 SOL, >= 22 unique 60-slot buyers with buyers >= sellers, positive
 //      180/60-slot net inflow, 15-slot net inflow >= 3.0 SOL & trend >= +7%, lead-buyer >= 3.0 SOL,
 //      early-cohort share <= 50%, no > 3 SOL dump in 15 slots) on a sell tick inside 3%-15%
-//      drawdown (+34% TP with 55% partial lock at +24% / -20% SL / 120-slot underwater decay cut).
+//      drawdown (+34% TP with 60% partial lock at +16% / -20% SL / 120-slot underwater decay cut).
 //   3. Sleeve B (Fresh-Flow Mid-Curve Dip): earlier distributed pullbacks (real reserve 5-20 SOL,
 //      15%-35% drawdown, >= 4 fresh buys in 15 slots, buyer count >= seller count over 60 slots,
-//      non-negative 60/180-slot net flow, low 5-slot sell pressure) (+34% TP with +24% partial / -15% SL).
+//      non-negative 60/180-slot net flow, low 5-slot sell pressure) (+34% TP with +16% partial / -15% SL).
 //   4. Sleeve C (Organic Retail Crowd): steady distributed accumulation (>= 32 unique 60-slot buyers
 //      on calm 5-26 SOL volume, non-negative 60-slot net inflow, recent peak <= 120 slots, shallow
-//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -13.5% SL / 185-slot accumulation hold).
+//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP with +16% partial / -13.5% SL / 185-slot hold).
 //   5. Sleeve D (Mature Reserve Pullback), Sleeve E (Mid-Life Consolidation Breakout),
 //      Sleeve F (Quiet Mid-Life Dip Stabilization), & Sleeve G (Quiet Fresh-Peak Distributed Dip):
 //      quiet-hour coverage sleeves gated by low intra-hour return (adjHourRet <= +0.10% / +0.05% / +0.01%)
 //      covering mature distributed curves (D/E/F) and fresh-peak low-overhang buyer-breadth dips
 //      (G: rq 12-22 SOL, dd 14%-25%, 4-15 buys/15s, peak <= 20s, n60 >= 12 SOL, v60 <= 40 SOL,
 //      u60 >= 22 & >= 1.8x sellers, dev <= 5%, top3 <= 55%) to achieve 24/24 positive hours.
-//   6. Sharpe-first volatility budget: RISK_SCALE = 0.75 with capped base equity min(eq, 10),
-//      tight position cap (0.29 SOL * scale), continuous hyperbolic intra-hour throttle
-//      (kUp=500, kDn=300) with +0.51% scaled hourly entry cap, no adds above +0.25% hour
-//      return, and tightened two-stage intra-hour profit lock (75% trim at +0.47% hour / +6.0%
-//      trade; full lock at +0.63% hour / +7.0% trade) compressing upper-tail hourly variance.
+//   6. Sharpe-first volatility budget: RISK_SCALE = 0.62 with capped base equity min(eq, 10),
+//      tight position cap (0.29 SOL * scale), universal +16% (60%) partial profit lock across all
+//      sleeves, continuous hyperbolic intra-hour throttle (kUp=500, kDn=300) with +0.51% scaled hourly
+//      entry cap, no adds above +0.25% hour return, and two-stage intra-hour profit lock (75% trim
+//      at +0.47% hour / +6.0% trade; full lock at +0.63% hour / +7.0% trade) compressing upper-tail
+//      hourly variance and keeping MaxDD <= 0.50%.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
-const RISK_SCALE = 0.75;
+const RISK_SCALE = 0.62;
 
 type SleeveId = 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G';
 
@@ -47,11 +48,11 @@ interface SleeveParams {
 const SLEEVE_CFG: Record<SleeveId, SleeveParams> = {
   A: { stakePct: 0.16, tp: 0.34, sl: 0.20, maxHold: 300, allowPartialTp: true, allowAdds: true, allowDecayExit: true },
   B: { stakePct: 0.14, tp: 0.34, sl: 0.15, maxHold: 200, allowPartialTp: true, allowAdds: true, allowDecayExit: true },
-  C: { stakePct: 0.24, tp: 0.18, sl: 0.135, maxHold: 185, allowPartialTp: false, allowAdds: true, allowDecayExit: false },
-  D: { stakePct: 0.50, tp: 0.24, sl: 0.10, maxHold: 110, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
-  E: { stakePct: 0.45, tp: 0.22, sl: 0.09, maxHold: 150, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
-  F: { stakePct: 0.40, tp: 0.24, sl: 0.10, maxHold: 120, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
-  G: { stakePct: 0.30, tp: 0.22, sl: 0.13, maxHold: 120, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
+  C: { stakePct: 0.24, tp: 0.18, sl: 0.135, maxHold: 185, allowPartialTp: true, allowAdds: true, allowDecayExit: false },
+  D: { stakePct: 0.50, tp: 0.24, sl: 0.10, maxHold: 110, allowPartialTp: true, allowAdds: false, allowDecayExit: false },
+  E: { stakePct: 0.45, tp: 0.22, sl: 0.09, maxHold: 150, allowPartialTp: true, allowAdds: false, allowDecayExit: false },
+  F: { stakePct: 0.40, tp: 0.24, sl: 0.10, maxHold: 120, allowPartialTp: true, allowAdds: false, allowDecayExit: false },
+  G: { stakePct: 0.30, tp: 0.22, sl: 0.13, maxHold: 120, allowPartialTp: true, allowAdds: false, allowDecayExit: false },
 };
 
 interface TradeRec {
@@ -232,8 +233,8 @@ export function createStrategy(): Bot {
               ps.partStep = 1;
               continue;
             }
-          } else if (ps.partStep === 0 && SLEEVE_CFG[ps.sleeve].allowPartialTp && ret >= 0.24 && !pend?.sell && orders.length < cap) {
-            const partTok = (pos.token_amount * 55n) / 100n;
+          } else if (ps.partStep === 0 && SLEEVE_CFG[ps.sleeve].allowPartialTp && ret >= 0.16 && !pend?.sell && orders.length < cap) {
+            const partTok = (pos.token_amount * 60n) / 100n;
             if (partTok > 0n) {
               orders.push({ side: 'sell', mint, token_amount: partTok, max_slippage_bps: 10_000 });
               ps.partStep = 1;
