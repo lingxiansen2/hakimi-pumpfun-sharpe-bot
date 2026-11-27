@@ -13,7 +13,7 @@
 //      non-negative 60/180-slot net flow, low 5-slot sell pressure) (+34% TP with +24% partial / -15% SL).
 //   4. Sleeve C (Organic Retail Crowd): steady distributed accumulation (>= 32 unique 60-slot buyers
 //      on calm 5-26 SOL volume, non-negative 60-slot net inflow, recent peak <= 120 slots, shallow
-//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -12% SL / 185-slot accumulation hold).
+//      dip dd <= 11% and ret15 in [-5%, 0%]) (+18% TP / -13.5% SL / 185-slot accumulation hold).
 //   5. Sleeve D (Mature Reserve Pullback), Sleeve E (Mid-Life Consolidation Breakout),
 //      Sleeve F (Quiet Mid-Life Dip Stabilization), & Sleeve G (Quiet Fresh-Peak Distributed Dip):
 //      quiet-hour coverage sleeves gated by low intra-hour return (adjHourRet <= +0.10% / +0.05% / +0.01%)
@@ -21,10 +21,10 @@
 //      (G: rq 12-22 SOL, dd 14%-25%, 4-15 buys/15s, peak <= 20s, n60 >= 12 SOL, v60 <= 40 SOL,
 //      u60 >= 22 & >= 1.8x sellers, dev <= 5%, top3 <= 55%) to achieve 24/24 positive hours.
 //   6. Sharpe-first volatility budget: RISK_SCALE = 0.75 with capped base equity min(eq, 10),
-//      max 2 concurrent positions, tight position cap (0.30 SOL * scale), continuous hyperbolic
-//      intra-hour throttle (kUp=500, kDn=300) with +0.62% scaled hourly entry cap, no adds above
-//      +0.25% hour return, and tightened two-stage intra-hour profit lock (75% trim at +0.50% hour /
-//      +6.8% trade; full lock at +0.68% hour / +7.8% trade) compressing upper-tail hourly variance.
+//      tight position cap (0.29 SOL * scale), continuous hyperbolic intra-hour throttle
+//      (kUp=500, kDn=300) with +0.51% scaled hourly entry cap, no adds above +0.25% hour
+//      return, and tightened two-stage intra-hour profit lock (75% trim at +0.47% hour / +6.0%
+//      trade; full lock at +0.63% hour / +7.0% trade) compressing upper-tail hourly variance.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
@@ -47,7 +47,7 @@ interface SleeveParams {
 const SLEEVE_CFG: Record<SleeveId, SleeveParams> = {
   A: { stakePct: 0.16, tp: 0.34, sl: 0.20, maxHold: 300, allowPartialTp: true, allowAdds: true, allowDecayExit: true },
   B: { stakePct: 0.14, tp: 0.34, sl: 0.15, maxHold: 200, allowPartialTp: true, allowAdds: true, allowDecayExit: true },
-  C: { stakePct: 0.24, tp: 0.18, sl: 0.12, maxHold: 185, allowPartialTp: false, allowAdds: true, allowDecayExit: false },
+  C: { stakePct: 0.24, tp: 0.18, sl: 0.135, maxHold: 185, allowPartialTp: false, allowAdds: true, allowDecayExit: false },
   D: { stakePct: 0.50, tp: 0.24, sl: 0.10, maxHold: 110, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
   E: { stakePct: 0.45, tp: 0.22, sl: 0.09, maxHold: 150, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
   F: { stakePct: 0.40, tp: 0.24, sl: 0.10, maxHold: 120, allowPartialTp: false, allowAdds: false, allowDecayExit: false },
@@ -110,7 +110,7 @@ export function createStrategy(): Bot {
   };
 
   const sleeveStakePct = (sleeve: SleeveId): number => SLEEVE_CFG[sleeve].stakePct * RISK_SCALE;
-  const maxPosCap = 0.30 * RISK_SCALE;
+  const maxPosCap = 0.29 * RISK_SCALE;
   const minInitSol = Math.max(0.011, 0.02 * RISK_SCALE);
   const minAddSol = Math.max(0.002, 0.02 * RISK_SCALE);
 
@@ -223,9 +223,9 @@ export function createStrategy(): Bot {
             ps.exiting = true;
           } else if (SLEEVE_CFG[ps.sleeve].allowDecayExit && ageHold >= 120 && ret <= -0.05) {
             ps.exiting = true;
-          } else if (adjHourRet >= 0.0068 && ret >= 0.078) {
+          } else if (adjHourRet >= 0.0063 && ret >= 0.070) {
             ps.exiting = true;
-          } else if (adjHourRet >= 0.0050 && ret >= 0.068 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
+          } else if (adjHourRet >= 0.0047 && ret >= 0.060 && ps.partStep === 0 && !pend?.sell && orders.length < cap) {
             const lockTok = (pos.token_amount * 75n) / 100n;
             if (lockTok > 0n) {
               orders.push({ side: 'sell', mint, token_amount: lockTok, max_slippage_bps: 10_000 });
@@ -251,7 +251,7 @@ export function createStrategy(): Bot {
         adjHourRet >= 0
           ? Math.max(0.12, 1 / (1 + adjHourRet * 500))
           : Math.max(0.25, 1 / (1 + -adjHourRet * 300));
-      const blockNew = adjHourRet >= 0.0062;
+      const blockNew = adjHourRet >= 0.0051;
 
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = Math.min(2, state.hello.caps.max_open_positions) - state.committedPositionCount();
